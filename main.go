@@ -3,6 +3,10 @@
 // Usage:
 //
 //	fiddler2pcap -i input.saz -o output.pcap --saz
+//	fiddler2pcap -i input.har -o output.pcap --har
+//	fiddler2pcap -i input.har.gz -o output.pcap --gz
+//	fiddler2pcap -i input.saz.gz -o output.pcap --gz --saz
+//	fiddler2pcap -i input.har.gz -o output.pcap --gz --har
 //	fiddler2pcap -i /path/to/raw/sessions/ -o output.pcap
 package main
 
@@ -10,6 +14,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -36,14 +41,16 @@ type sessionMetadata struct {
 
 // SessionData represents a complete session with metadata, request, and response
 type SessionData struct {
-	Index       int    `json:"index"`
-	URL         string `json:"url,omitempty"`
-	Host        string `json:"host,omitempty"`
-	Path        string `json:"path,omitempty"`
-	Method      string `json:"method,omitempty"`
-	Protocol    string `json:"protocol,omitempty"`
-	Status      int    `json:"status,omitempty"`
-	IsDeproxied bool   `json:"is_deproxied,omitempty"`
+	Index              int    `json:"index"`
+	URL                string `json:"url,omitempty"`
+	Host               string `json:"host,omitempty"`
+	Path               string `json:"path,omitempty"`
+	Method             string `json:"method,omitempty"`
+	Protocol           string `json:"protocol,omitempty"`
+	Status             int    `json:"status,omitempty"`
+	IsDeproxied        bool   `json:"is_deproxied,omitempty"`
+	IsHTTP11Normalized bool   `json:"is_http11_normalized,omitempty"`
+	IsDNSResolved      bool   `json:"is_dns_resolved,omitempty"`
 
 	// Request data
 	RequestHeaders map[string]string `json:"request_headers,omitempty"`
@@ -78,18 +85,21 @@ type SessionData struct {
 }
 
 var (
-	srcIP      string
-	dstIP      string
-	srcPort    int
-	dstPort    int
-	outputPath string
-	inputPath  string
-	sazMode    bool
-	harMode    bool
-	jsonOutput bool
-	debugMode  bool
-	deProxy    bool
-	split      bool
+	srcIP        string
+	dstIP        string
+	srcPort      int
+	dstPort      int
+	outputPath   string
+	inputPath    string
+	sazMode      bool
+	harMode      bool
+	gzMode       bool
+	jsonOutput   bool
+	debugMode    bool
+	deProxy      bool
+	resolveHosts bool
+	http11       bool
+	split        bool
 )
 
 // exportToJSON exports session data to a JSON file
@@ -124,7 +134,7 @@ func exportToJSON(sessions []SessionData, outputPath string) error {
 	return nil
 }
 
-// detectFileType tries to determine if the input file is a SAZ or HAR file
+// detectFileType tries to determine if the input file is a SAZ, HAR, or GZ file
 func detectFileType(filePath string) (string, error) {
 	// Check the file extension first
 	ext := strings.ToLower(filepath.Ext(filePath))
@@ -132,6 +142,8 @@ func detectFileType(filePath string) (string, error) {
 		return "saz", nil
 	} else if ext == ".har" {
 		return "har", nil
+	} else if ext == ".gz" {
+		return "gz", nil
 	}
 
 	// If extension doesn't clearly indicate the type, try to read file contents
@@ -177,6 +189,66 @@ func detectFileType(filePath string) (string, error) {
 	return "", fmt.Errorf("unable to determine file type")
 }
 
+// decompressGZ decompresses a .gz file and returns the decompressed data and detected inner type
+// If innerTypeHint is provided (e.g., "saz" or "har"), it will be used instead of auto-detection
+func decompressGZ(gzPath string, innerTypeHint string) (string, string, error) {
+	// Open the gzip file
+	file, err := os.Open(gzPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to open gz file: %v", err)
+	}
+	defer file.Close()
+
+	// Create gzip reader
+	gzReader, err := gzip.NewReader(file)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create gzip reader: %v", err)
+	}
+	defer gzReader.Close()
+
+	// Create temporary file for decompressed content
+	tempFile, err := os.CreateTemp("", "robocap-decompressed-*")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	tempPath := tempFile.Name()
+
+	// Copy decompressed data to temp file
+	_, err = io.Copy(tempFile, gzReader)
+	tempFile.Close()
+	if err != nil {
+		os.Remove(tempPath)
+		return "", "", fmt.Errorf("failed to decompress gz file: %v", err)
+	}
+
+	// Use the hint if provided
+	var innerType string
+	if innerTypeHint != "" {
+		innerType = innerTypeHint
+		log.Printf("Using provided inner type hint: %s", innerType)
+	} else {
+		// Detect the type of the decompressed file
+		innerType, err = detectFileType(tempPath)
+		if err != nil {
+			// If detection fails, try to infer from the original filename
+			baseName := filepath.Base(gzPath)
+			baseName = strings.TrimSuffix(baseName, ".gz")
+			baseExt := strings.ToLower(filepath.Ext(baseName))
+
+			if baseExt == ".har" {
+				innerType = "har"
+			} else if baseExt == ".saz" {
+				innerType = "saz"
+			} else {
+				os.Remove(tempPath)
+				return "", "", fmt.Errorf("unable to determine inner file type: %v", err)
+			}
+		}
+	}
+
+	return tempPath, innerType, nil
+}
+
 func main() {
 	// Parse command line flags
 	flag.StringVar(&srcIP, "sip", "192.168.1.1", "Source IP address")
@@ -184,12 +256,15 @@ func main() {
 	flag.IntVar(&srcPort, "sp", 12345, "Source port")
 	flag.IntVar(&dstPort, "dp", 80, "Destination port")
 	flag.StringVar(&outputPath, "o", "output.pcap", "Output PCAP file path")
-	flag.StringVar(&inputPath, "i", "", "Input directory, SAZ, or HAR file")
+	flag.StringVar(&inputPath, "i", "", "Input directory, SAZ, HAR, or GZ file")
 	flag.BoolVar(&sazMode, "saz", false, "Input is a SAZ file (auto-detected if not specified)")
 	flag.BoolVar(&harMode, "har", false, "Input is a HAR file (auto-detected if not specified)")
+	flag.BoolVar(&gzMode, "gz", false, "Input is a gzipped file (auto-detected if not specified)")
 	flag.BoolVar(&jsonOutput, "json", false, "Output session data as JSON")
 	flag.BoolVar(&debugMode, "debug", false, "Enable debug logging")
 	flag.BoolVar(&deProxy, "deproxy", false, "Remove proxy information from URLs")
+	flag.BoolVar(&resolveHosts, "resolve", false, "Resolve hostnames to IP addresses via DNS (only applies when -deproxy is used)")
+	flag.BoolVar(&http11, "http11", false, "Downgrade HTTP/2 to HTTP/1.1 and add Content-Length headers")
 	flag.BoolVar(&split, "split", false, "Split output into separate files for HTTP and HTTPS")
 
 	flag.Parse()
@@ -204,7 +279,19 @@ func main() {
 
 	// Auto-detect file type if not explicitly specified
 	fileType := ""
-	if !sazMode && !harMode {
+	var innerTypeHint string // Hint for what's inside a gz file
+
+	// Check if gz is used with saz or har flags
+	if gzMode && (sazMode || harMode) {
+		fileType = "gz"
+		if sazMode {
+			innerTypeHint = "saz"
+			log.Printf("GZ mode with SAZ hint: file will be decompressed and treated as SAZ")
+		} else if harMode {
+			innerTypeHint = "har"
+			log.Printf("GZ mode with HAR hint: file will be decompressed and treated as HAR")
+		}
+	} else if !sazMode && !harMode && !gzMode {
 		detectedType, err := detectFileType(inputPath)
 		if err != nil {
 			log.Printf("Warning: could not auto-detect file type: %v, assuming directory mode", err)
@@ -217,10 +304,86 @@ func main() {
 		fileType = "saz"
 	} else if harMode {
 		fileType = "har"
+	} else if gzMode {
+		fileType = "gz"
 	}
 
 	// Process input based on detected or specified file type
 	switch fileType {
+	case "gz":
+		// Decompress GZ file and process the inner content
+		log.Printf("Decompressing GZ file: %s", inputPath)
+		tempPath, innerType, err := decompressGZ(inputPath, innerTypeHint)
+		if err != nil {
+			log.Fatalf("Failed to decompress GZ file: %v", err)
+		}
+		defer os.Remove(tempPath)
+
+		log.Printf("Detected inner file type: %s", innerType)
+
+		// Process based on inner file type
+		switch innerType {
+		case "saz":
+			// Extract SAZ file to a temporary directory
+			tempDir, err := os.MkdirTemp("", "robocap")
+			if err != nil {
+				log.Fatalf("Failed to create temporary directory: %v", err)
+			}
+			defer os.RemoveAll(tempDir)
+
+			log.Printf("Extracting SAZ file to: %s", tempDir)
+			if err := extractSAZ(tempPath, tempDir); err != nil {
+				log.Fatalf("Failed to extract SAZ file: %v", err)
+			}
+
+			// Process extracted sessions
+			rawDir := filepath.Join(tempDir, "raw")
+			sessions, err := ProcessSessions(rawDir, outputPath, deProxy, resolveHosts, http11, split, jsonOutput, debugMode, srcIP, dstIP)
+			if err != nil {
+				log.Fatalf("Failed to process sessions: %v", err)
+			}
+
+			// Log files created
+			if split {
+				fmt.Printf("Created: %s.http.pcap\n", outputPath)
+				fmt.Printf("Created: %s.https.pcap\n", outputPath)
+			} else {
+				fmt.Printf("Created: %s\n", outputPath)
+			}
+			if jsonOutput {
+				jsonPath := outputPath + ".json"
+				fmt.Printf("Created: %s\n", jsonPath)
+			}
+			fmt.Printf("Processed %d sessions\n", len(sessions))
+
+		case "har":
+			// Process HAR file
+			log.Printf("Processing HAR file from decompressed GZ")
+			sessions, err := ProcessHAR(tempPath, outputPath, deProxy, resolveHosts, http11, debugMode, srcIP, dstIP)
+			if err != nil {
+				log.Fatalf("Failed to process HAR file: %v", err)
+			}
+
+			// Export to JSON if enabled
+			if jsonOutput {
+				jsonPath := outputPath + ".json"
+				if err := exportToJSON(sessions, jsonPath); err != nil {
+					log.Fatalf("Failed to export JSON: %v", err)
+				}
+			}
+
+			// Log files created
+			fmt.Printf("Created: %s\n", outputPath)
+			if jsonOutput {
+				jsonPath := outputPath + ".json"
+				fmt.Printf("Created: %s\n", jsonPath)
+			}
+			fmt.Printf("Processed %d sessions\n", len(sessions))
+
+		default:
+			log.Fatalf("Unsupported inner file type in GZ: %s", innerType)
+		}
+
 	case "saz":
 		// Extract SAZ file to a temporary directory
 		tempDir, err := os.MkdirTemp("", "robocap")
@@ -236,7 +399,7 @@ func main() {
 
 		// Process extracted sessions
 		rawDir := filepath.Join(tempDir, "raw")
-		sessions, err := ProcessSessions(rawDir, outputPath, deProxy, split, jsonOutput, debugMode)
+		sessions, err := ProcessSessions(rawDir, outputPath, deProxy, resolveHosts, http11, split, jsonOutput, debugMode, srcIP, dstIP)
 		if err != nil {
 			log.Fatalf("Failed to process sessions: %v", err)
 		}
@@ -257,7 +420,7 @@ func main() {
 	case "har":
 		// Process HAR file
 		log.Printf("Processing HAR file: %s", inputPath)
-		sessions, err := ProcessHAR(inputPath, outputPath, deProxy, debugMode, srcIP, dstIP)
+		sessions, err := ProcessHAR(inputPath, outputPath, deProxy, resolveHosts, http11, debugMode, srcIP, dstIP)
 		if err != nil {
 			log.Fatalf("Failed to process HAR file: %v", err)
 		}
@@ -273,7 +436,7 @@ func main() {
 	case "dir", "":
 		// Process raw directory
 		log.Printf("Processing directory: %s", inputPath)
-		sessions, err := ProcessSessions(inputPath, outputPath, deProxy, split, jsonOutput, debugMode)
+		sessions, err := ProcessSessions(inputPath, outputPath, deProxy, resolveHosts, http11, split, jsonOutput, debugMode, srcIP, dstIP)
 		if err != nil {
 			log.Fatalf("Failed to process sessions: %v", err)
 		}
@@ -462,10 +625,12 @@ func parseMetadata(metaPath string) (sessionMetadata, error) {
 }
 
 // collectSessionData gathers session data for JSON export
-func collectSessionData(dirPath, sessionID string, meta sessionMetadata, reqData, respData []byte, xmlMeta xmlMetadata) SessionData {
+func collectSessionData(dirPath, sessionID string, meta sessionMetadata, reqData, respData []byte, xmlMeta xmlMetadata, http11, resolveHosts bool) SessionData {
 	session := SessionData{
-		RequestHeaders:  make(map[string]string),
-		ResponseHeaders: make(map[string]string),
+		RequestHeaders:     make(map[string]string),
+		ResponseHeaders:    make(map[string]string),
+		IsHTTP11Normalized: http11,
+		IsDNSResolved:      resolveHosts,
 		Metadata: struct {
 			ClientIP   string `json:"client_ip,omitempty"`
 			ClientPort int    `json:"client_port,omitempty"`

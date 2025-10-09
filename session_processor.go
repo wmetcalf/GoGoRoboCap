@@ -87,8 +87,122 @@ func splitString(s string) []string {
 	return result
 }
 
+// normalizeHTTPData normalizes HTTP data to HTTP/1.1 format
+// isRequest indicates whether this is a request (true) or response (false)
+func normalizeHTTPData(data []byte, isRequest bool, debug bool) []byte {
+	if len(data) == 0 {
+		return data
+	}
+
+	// Split into headers and body
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd == -1 {
+		// No body separator found, treat entire data as headers
+		headerEnd = len(data)
+	}
+
+	headers := data[:headerEnd]
+	var body []byte
+	if headerEnd+4 <= len(data) {
+		body = data[headerEnd+4:]
+	}
+
+	// Split headers into lines
+	headerLines := bytes.Split(headers, []byte("\r\n"))
+	if len(headerLines) == 0 {
+		return data
+	}
+
+	// Process the first line (request/status line)
+	firstLine := string(headerLines[0])
+	parts := strings.Fields(firstLine)
+
+	if len(parts) < 3 {
+		return data // Invalid format, return as-is
+	}
+
+	// Normalize HTTP version to HTTP/1.1
+	// Note: Only normalize HTTP/2.x versions (e.g., "HTTP/2.0", "HTTP/2") to handle fake HTTP/2 requests
+	// in some HAR file generations where content-length isn't present but it's not true HTTP/2.0 traffic.
+	// We do NOT normalize h2/h2c protocols as those represent actual HTTP/2 connections.
+	if isRequest {
+		// Request line: METHOD PATH VERSION
+		httpVersion := parts[2]
+		if strings.HasPrefix(httpVersion, "HTTP/2") {
+			parts[2] = "HTTP/1.1"
+			headerLines[0] = []byte(strings.Join(parts, " "))
+			if debug {
+				log.Printf("[DEBUG] Normalized request version from %s to HTTP/1.1", httpVersion)
+			}
+		}
+	} else {
+		// Status line: VERSION STATUS TEXT
+		httpVersion := parts[0]
+		if strings.HasPrefix(httpVersion, "HTTP/2") {
+			parts[0] = "HTTP/1.1"
+			headerLines[0] = []byte(strings.Join(parts, " "))
+			if debug {
+				log.Printf("[DEBUG] Normalized response version from %s to HTTP/1.1", httpVersion)
+			}
+		}
+	}
+
+	// Process other headers
+	hasContentLength := false
+	var newHeaderLines [][]byte
+	newHeaderLines = append(newHeaderLines, headerLines[0])
+
+	for i := 1; i < len(headerLines); i++ {
+		line := headerLines[i]
+		if len(line) == 0 {
+			continue
+		}
+
+		headerName := ""
+		if idx := bytes.IndexByte(line, ':'); idx > 0 {
+			headerName = strings.ToLower(string(bytes.TrimSpace(line[:idx])))
+		}
+
+		if headerName == "content-length" {
+			hasContentLength = true
+			newHeaderLines = append(newHeaderLines, line)
+		} else if headerName == "transfer-encoding" {
+			// Skip Transfer-Encoding if we're adding Content-Length (same logic as HAR processor)
+			// Only skip when: http11 is enabled, we have a body, and we don't already have Content-Length
+			if len(body) > 0 && !hasContentLength {
+				if debug {
+					log.Printf("[DEBUG] Removing Transfer-Encoding header (will use Content-Length)")
+				}
+				continue
+			}
+			newHeaderLines = append(newHeaderLines, line)
+		} else {
+			newHeaderLines = append(newHeaderLines, line)
+		}
+	}
+
+	// Add Content-Length if we have a body and no Content-Length header
+	if len(body) > 0 && !hasContentLength {
+		contentLengthHeader := []byte(fmt.Sprintf("Content-Length: %d", len(body)))
+		newHeaderLines = append(newHeaderLines, contentLengthHeader)
+		if debug {
+			log.Printf("[DEBUG] Added Content-Length: %d", len(body))
+		}
+	}
+
+	// Rebuild HTTP data
+	var result bytes.Buffer
+	result.Write(bytes.Join(newHeaderLines, []byte("\r\n")))
+	result.WriteString("\r\n\r\n")
+	if len(body) > 0 {
+		result.Write(body)
+	}
+
+	return result.Bytes()
+}
+
 // processSession processes a single session from a SAZ file
-func processSession(dirPath, sessionID string, writer *pcapgo.Writer, deProxy, debug bool) error {
+func processSession(dirPath, sessionID string, writer *pcapgo.Writer, deProxy, resolveHosts, http11, debug bool, srcIP, dstIP string) error {
 	if debug {
 		log.Printf("Processing session %s", sessionID)
 	}
@@ -185,10 +299,19 @@ func processSession(dirPath, sessionID string, writer *pcapgo.Writer, deProxy, d
 				hostname = hostname[:idx]
 			}
 
-			// Resolve hostname to IP
-			addrs, err := net.LookupHost(hostname)
-			if err == nil && len(addrs) > 0 {
-				meta.hostIP = addrs[0]
+			// Resolve hostname to IP using the same logic as HAR processor
+			if resolveHosts {
+				// Use ResolveHostIP which caches DNS lookups and handles edge cases
+				meta.hostIP = ResolveHostIP(hostname, dstIP)
+				if debug {
+					log.Printf("Resolved hostname '%s' to IP: %s", hostname, meta.hostIP)
+				}
+			} else {
+				// When resolveHosts is not enabled, use dstIP as default
+				meta.hostIP = dstIP
+				if debug {
+					log.Printf("Using default dstIP for hostname '%s': %s", hostname, dstIP)
+				}
 			}
 		}
 
@@ -217,12 +340,20 @@ func processSession(dirPath, sessionID string, writer *pcapgo.Writer, deProxy, d
 		}
 	}
 
+	// Apply HTTP/1.1 normalization if requested
+	if http11 {
+		reqData = normalizeHTTPData(reqData, true, debug)
+		if len(respData) > 0 {
+			respData = normalizeHTTPData(respData, false, debug)
+		}
+	}
+
 	// Generate and write packets
-	return generateSessionPackets(meta, reqData, respData, writer, debug)
+	return generateSessionPackets(meta, reqData, respData, writer, http11, debug, srcIP, dstIP)
 }
 
 // generateSessionPackets generates PCAP packets for a session and writes them to the PCAP writer
-func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writer *pcapgo.Writer, debug bool) error {
+func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writer *pcapgo.Writer, http11, debug bool, defaultSrcIP, defaultDstIP string) error {
 	if debug {
 		log.Printf("Generating packets for session")
 	}
@@ -233,7 +364,15 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 		srcIP = net.ParseIP(meta.clientIP)
 	}
 	if srcIP == nil {
-		srcIP = net.ParseIP("192.168.1.1") // Default source IP
+		srcIP = net.ParseIP(defaultSrcIP) // Use default source IP from parameters
+	}
+
+	// Replace loopback source addresses with default to avoid invalid Ethernet frames
+	if srcIP.IsLoopback() {
+		if debug {
+			log.Printf("[DEBUG] Replacing loopback source IP %s with %s", srcIP.String(), defaultSrcIP)
+		}
+		srcIP = net.ParseIP(defaultSrcIP)
 	}
 
 	var dstIP net.IP
@@ -241,7 +380,15 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 		dstIP = net.ParseIP(meta.hostIP)
 	}
 	if dstIP == nil {
-		dstIP = net.ParseIP("10.0.0.1") // Default destination IP
+		dstIP = net.ParseIP(defaultDstIP) // Use default destination IP from parameters
+	}
+
+	// Replace loopback destination addresses with default to avoid invalid Ethernet frames
+	if dstIP.IsLoopback() {
+		if debug {
+			log.Printf("[DEBUG] Replacing loopback destination IP %s with %s", dstIP.String(), defaultDstIP)
+		}
+		dstIP = net.ParseIP(defaultDstIP)
 	}
 
 	// Parse ports
@@ -276,7 +423,7 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 }
 
 // ProcessSessions processes all session files in the given directory and writes them to a PCAP file
-func ProcessSessions(dirPath, outputPath string, deProxy, split, jsonOutput, debug bool) ([]SessionData, error) {
+func ProcessSessions(dirPath, outputPath string, deProxy, resolveHosts, http11, split, jsonOutput, debug bool, srcIP, dstIP string) ([]SessionData, error) {
 	var writers pcapWriters
 	var err error
 
@@ -459,7 +606,7 @@ func ProcessSessions(dirPath, outputPath string, deProxy, split, jsonOutput, deb
 			}
 
 			// Process the session for PCAP
-			if err := processSession(dirPath, sessionID, writer, deProxy, debug); err != nil {
+			if err := processSession(dirPath, sessionID, writer, deProxy, resolveHosts, http11, debug, srcIP, dstIP); err != nil {
 				writers.cleanup()
 				log.Printf("Error processing session %s: %v", sessionID, err)
 				continue // Skip to next session if this one fails
@@ -480,7 +627,7 @@ func ProcessSessions(dirPath, outputPath string, deProxy, split, jsonOutput, deb
 				_ = xml.Unmarshal(data, &xmlMeta) // Ignore errors, we'll use what we can
 			}
 
-			sessionData := collectSessionData(dirPath, sessionID, meta, reqData, respData, xmlMeta)
+			sessionData := collectSessionData(dirPath, sessionID, meta, reqData, respData, xmlMeta, http11, resolveHosts)
 			sessionData.Index = sessionIndex
 			sessionIndex++
 

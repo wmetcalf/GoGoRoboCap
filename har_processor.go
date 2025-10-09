@@ -238,7 +238,7 @@ type HARCookie struct {
 
 // ProcessHAR processes a HAR file and generates a PCAP file with optional deproxy support
 // Returns the list of processed sessions and any error that occurred
-func ProcessHAR(harPath, outputPath string, deProxy, debug bool, srcIP, dstIP string) ([]SessionData, error) {
+func ProcessHAR(harPath, outputPath string, deProxy, resolveHosts, http11, debug bool, srcIP, dstIP string) ([]SessionData, error) {
 	var sessions []SessionData
 
 	if debug {
@@ -276,7 +276,7 @@ func ProcessHAR(harPath, outputPath string, deProxy, debug bool, srcIP, dstIP st
 	}
 
 	for i, entry := range harData.Log.Entries {
-		session, err := processHAREntry(entry, i, pcapWriter, deProxy, debug, srcIP, dstIP)
+		session, err := processHAREntry(entry, i, pcapWriter, deProxy, resolveHosts, http11, debug, srcIP, dstIP)
 		if err != nil {
 			if debug {
 				log.Printf("Error processing entry %d: %v", i, err)
@@ -290,11 +290,13 @@ func ProcessHAR(harPath, outputPath string, deProxy, debug bool, srcIP, dstIP st
 }
 
 // processHAREntry processes a single entry from a HAR file
-func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, debug bool, srcIP, dstIP string) (SessionData, error) {
+func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, resolveHosts, http11, debug bool, srcIP, dstIP string) (SessionData, error) {
 	session := SessionData{
-		Index:           index,
-		RequestHeaders:  make(map[string]string),
-		ResponseHeaders: make(map[string]string),
+		Index:              index,
+		RequestHeaders:     make(map[string]string),
+		ResponseHeaders:    make(map[string]string),
+		IsHTTP11Normalized: http11,
+		IsDNSResolved:      resolveHosts,
 	}
 
 	// Parse URL
@@ -410,8 +412,12 @@ func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, 
 		if debug {
 			log.Printf("Using destination IP for spoofed file:// URL: %s", resolvedIP)
 		}
-	} else if entry.ServerIPAddress != "" {
+	} else if !deProxy && entry.ServerIPAddress != "" {
+		// Use serverIPAddress from HAR when deProxy is not enabled, preserving it as-is
 		resolvedIP = entry.ServerIPAddress
+		if debug {
+			log.Printf("Using serverIPAddress from HAR (preserved as-is): %s", resolvedIP)
+		}
 		// Add to hostname mapping for future use
 		AddHostnameMapping(hostname, resolvedIP)
 		// Also add mapping for hostname without port if it has one
@@ -419,18 +425,41 @@ func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, 
 			hostWithoutPort := strings.Split(hostname, ":")[0]
 			AddHostnameMapping(hostWithoutPort, resolvedIP)
 		}
+	} else if deProxy && !resolveHosts {
+		// When deProxy is enabled but resolveHosts is not, just replace localhost with dstIP
+		if entry.ServerIPAddress != "" && (entry.ServerIPAddress == "127.0.0.1" || entry.ServerIPAddress == "::1" || entry.ServerIPAddress == "localhost") {
+			// Replace localhost addresses with dstIP
+			resolvedIP = dstIP
+			if debug {
+				log.Printf("Replacing localhost serverIPAddress %s with dstIP: %s", entry.ServerIPAddress, dstIP)
+			}
+		} else if entry.ServerIPAddress != "" {
+			// Use the serverIPAddress as-is if it's not localhost
+			resolvedIP = entry.ServerIPAddress
+			if debug {
+				log.Printf("Using serverIPAddress from HAR: %s", resolvedIP)
+			}
+		} else {
+			// No serverIPAddress provided, use dstIP
+			resolvedIP = dstIP
+			if debug {
+				log.Printf("No serverIPAddress in HAR, using dstIP: %s", dstIP)
+			}
+		}
 	} else {
+		// When both deProxy and resolveHosts are enabled, do DNS resolution
 		// Check if hostname is an IP address
 		if ip := net.ParseIP(hostname); ip != nil {
 			resolvedIP = ip.String()
+			if debug {
+				log.Printf("Hostname is already an IP: %s", resolvedIP)
+			}
 		} else {
-			// Try to resolve the hostname
+			// Try to resolve the hostname via DNS
 			resolvedIP = ResolveHostIP(hostname, dstIP)
-		}
-
-		// Log warnings for potential issues
-		if resolvedIP == "127.0.0.1" {
-			log.Printf("[WARN] Resolved '%s' to localhost (127.0.0.1)", hostname)
+			if debug {
+				log.Printf("Resolved hostname '%s' to IP: %s", hostname, resolvedIP)
+			}
 		}
 
 		// Add to hostname mapping if we have a valid IP
@@ -440,6 +469,14 @@ func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, 
 				hostWithoutPort := strings.Split(hostname, ":")[0]
 				AddHostnameMapping(hostWithoutPort, resolvedIP)
 			}
+		}
+
+		// Check for loopback addresses and replace them with dstIP when resolving
+		if resolvedIP == "127.0.0.1" || resolvedIP == "::1" || resolvedIP == "localhost" {
+			if debug {
+				log.Printf("[DEBUG] Replacing loopback destination IP %s with %s", resolvedIP, dstIP)
+			}
+			resolvedIP = dstIP
 		}
 	}
 
@@ -476,7 +513,7 @@ func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, 
 	}
 
 	// Generate packets
-	if err := generatePacketsFromHAR(session, writer, debug); err != nil {
+	if err := generatePacketsFromHAR(session, writer, http11, debug); err != nil {
 		return session, fmt.Errorf("failed to generate packets: %v", err)
 	}
 
@@ -484,7 +521,7 @@ func processHAREntry(entry HAREntry, index int, writer *pcapgo.Writer, deProxy, 
 }
 
 // buildHTTPRequest builds an HTTP request from session data
-func buildHTTPRequest(session SessionData) []byte {
+func buildHTTPRequest(session SessionData, http11 bool) []byte {
 	var request strings.Builder
 
 	// Build the path/URL to use in the request line
@@ -498,24 +535,48 @@ func buildHTTPRequest(session SessionData) []byte {
 	if httpVersion == "" {
 		httpVersion = "HTTP/1.1"
 	}
+	// Normalize HTTP/2 variants to HTTP/1.1 if http11 flag is set
+	if http11 && (strings.HasPrefix(httpVersion, "HTTP/2") || httpVersion == "h2" || httpVersion == "h2c") {
+		httpVersion = "HTTP/1.1"
+	}
 	request.WriteString(fmt.Sprintf("%s %s %s\r\n", session.Method, requestPath, httpVersion))
 
-	// Ensure we have a Host header - this is required for HTTP/1.1
+	// Check for existing headers
 	hasHostHeader := false
+	hasContentLength := false
 	for name := range session.RequestHeaders {
-		if strings.ToLower(name) == "host" {
+		nameLower := strings.ToLower(name)
+		if nameLower == "host" {
 			hasHostHeader = true
-			break
+		}
+		if nameLower == "content-length" {
+			hasContentLength = true
 		}
 	}
 
-	// Add Host header if not present
+	// Add Host header if not present (required for HTTP/1.1)
 	if !hasHostHeader && session.Host != "" {
 		request.WriteString(fmt.Sprintf("Host: %s\r\n", session.Host))
 	}
 
-	// Add other headers
+	// Calculate body length if we have a body
+	bodyLength := 0
+	if session.RequestBody != "" {
+		bodyLength = len(session.RequestBody)
+	}
+
+	// Add Content-Length if http11 flag is set, we have a body, and it's not already present
+	if http11 && bodyLength > 0 && !hasContentLength {
+		request.WriteString(fmt.Sprintf("Content-Length: %d\r\n", bodyLength))
+	}
+
+	// Add other headers (skip Transfer-Encoding: chunked if we added content-length)
 	for name, value := range session.RequestHeaders {
+		nameLower := strings.ToLower(name)
+		// Skip transfer-encoding if we added content-length
+		if http11 && nameLower == "transfer-encoding" && bodyLength > 0 && !hasContentLength {
+			continue
+		}
 		request.WriteString(fmt.Sprintf("%s: %s\r\n", name, value))
 	}
 
@@ -531,7 +592,7 @@ func buildHTTPRequest(session SessionData) []byte {
 }
 
 // buildHTTPResponse builds an HTTP response from session data
-func buildHTTPResponse(session SessionData) []byte {
+func buildHTTPResponse(session SessionData, http11 bool) []byte {
 	var response strings.Builder
 
 	// Status line
@@ -544,11 +605,40 @@ func buildHTTPResponse(session SessionData) []byte {
 	if httpVersion == "" {
 		httpVersion = "HTTP/1.1"
 	}
+	// Normalize HTTP/2 variants to HTTP/1.1 if http11 flag is set
+	if http11 && (strings.HasPrefix(httpVersion, "HTTP/2") || httpVersion == "h2" || httpVersion == "h2c") {
+		httpVersion = "HTTP/1.1"
+	}
 
 	response.WriteString(fmt.Sprintf("%s %d %s\r\n", httpVersion, session.Status, statusText))
 
-	// Add headers
+	// Check for existing Content-Length header
+	hasContentLength := false
+	for name := range session.ResponseHeaders {
+		if strings.ToLower(name) == "content-length" {
+			hasContentLength = true
+			break
+		}
+	}
+
+	// Calculate body length if we have a body
+	bodyLength := 0
+	if session.ResponseBody != "" {
+		bodyLength = len(session.ResponseBody)
+	}
+
+	// Add Content-Length if http11 flag is set, we have a body, and it's not already present
+	if http11 && bodyLength > 0 && !hasContentLength {
+		response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", bodyLength))
+	}
+
+	// Add other headers (skip Transfer-Encoding: chunked if we added content-length)
 	for name, value := range session.ResponseHeaders {
+		nameLower := strings.ToLower(name)
+		// Skip transfer-encoding if we added content-length
+		if http11 && nameLower == "transfer-encoding" && bodyLength > 0 && !hasContentLength {
+			continue
+		}
 		response.WriteString(fmt.Sprintf("%s: %s\r\n", name, value))
 	}
 
@@ -564,7 +654,7 @@ func buildHTTPResponse(session SessionData) []byte {
 }
 
 // generatePacketsFromHAR generates PCAP packets from HAR session data
-func generatePacketsFromHAR(session SessionData, writer *pcapgo.Writer, debug bool) error {
+func generatePacketsFromHAR(session SessionData, writer *pcapgo.Writer, http11, debug bool) error {
 	// Parse source and destination IPs from session metadata
 	srcIP := net.ParseIP(session.Metadata.ClientIP)
 	if srcIP == nil {
@@ -598,8 +688,8 @@ func generatePacketsFromHAR(session SessionData, writer *pcapgo.Writer, debug bo
 	}
 
 	// Prepare HTTP request and response data
-	reqData := buildHTTPRequest(session)
-	respData := buildHTTPResponse(session)
+	reqData := buildHTTPRequest(session, http11)
+	respData := buildHTTPResponse(session, http11)
 
 	// Create packet generator
 	packetGen := NewPacketGenerator(writer, srcIP, dstIP, srcPort, dstPort, debug)
