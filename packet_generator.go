@@ -196,7 +196,8 @@ func (pg *PacketGenerator) generateTCPHandshake(clientISN, serverISN uint32) err
 	return pg.sendPacket(ackEth, ackIP, ackTCP, nil)
 }
 
-// segmentAndSendData segments a large payload into smaller TCP packets and sends them
+// segmentAndSendData segments a large payload into smaller TCP packets and sends them.
+// srcIP/dstIP and srcPort/dstPort determine the direction — MACs are derived accordingly.
 func (pg *PacketGenerator) segmentAndSendData(srcIP, dstIP net.IP, srcPort, dstPort uint16,
 	seq, ack uint32, data []byte) error {
 	// Constants for packet sizing
@@ -245,10 +246,17 @@ func (pg *PacketGenerator) segmentAndSendData(srcIP, dstIP net.IP, srcPort, dstP
 		segment := data[offset:end]
 		isLast := (i == segmentCount-1)
 
-		// Create Ethernet layer
+		// Create Ethernet layer — swap MACs based on direction
+		// If srcIP matches pg.srcIP this is client→server, otherwise server→client
+		ethSrcMAC := pg.srcMAC
+		ethDstMAC := pg.dstMAC
+		if !srcIP.Equal(pg.srcIP) {
+			ethSrcMAC = pg.dstMAC
+			ethDstMAC = pg.srcMAC
+		}
 		eth := &layers.Ethernet{
-			SrcMAC:       pg.srcMAC,
-			DstMAC:       pg.dstMAC,
+			SrcMAC:       ethSrcMAC,
+			DstMAC:       ethDstMAC,
 			EthernetType: layers.EthernetTypeIPv4,
 		}
 
@@ -290,9 +298,6 @@ func (pg *PacketGenerator) segmentAndSendData(srcIP, dstIP net.IP, srcPort, dstP
 			return fmt.Errorf("error sending data segment %d/%d (offset: %d, len: %d): %v",
 				i+1, segmentCount, offset, len(segment), err)
 		}
-
-		// Small delay between packets to avoid overwhelming the system
-		time.Sleep(1 * time.Millisecond)
 	}
 
 	// Send ACK for the entire data transfer

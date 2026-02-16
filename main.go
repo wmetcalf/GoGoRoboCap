@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/gopacket/pcapgo"
 )
@@ -85,21 +86,21 @@ type SessionData struct {
 }
 
 var (
-	srcIP        string
-	dstIP        string
-	srcPort      int
-	dstPort      int
-	outputPath   string
-	inputPath    string
-	sazMode      bool
-	harMode      bool
-	gzMode       bool
-	jsonOutput   bool
-	debugMode    bool
-	deProxy      bool
-	resolveHosts bool
-	http11       bool
-	split        bool
+	srcIP            string
+	dstIP            string
+	srcPort          int
+	dstPort          int
+	outputPath       string
+	inputPath        string
+	sazMode          bool
+	harMode          bool
+	gzMode           bool
+	jsonOutput       bool
+	debugMode        bool
+	deProxy          bool
+	resolveHosts     bool
+	http11           bool
+	split            bool
 )
 
 // exportToJSON exports session data to a JSON file
@@ -266,10 +267,9 @@ func main() {
 	flag.BoolVar(&resolveHosts, "resolve", false, "Resolve hostnames to IP addresses via DNS (only applies when -deproxy is used)")
 	flag.BoolVar(&http11, "http11", false, "Downgrade HTTP/2 to HTTP/1.1 and add Content-Length headers")
 	flag.BoolVar(&split, "split", false, "Split output into separate files for HTTP and HTTPS")
-
 	flag.Parse()
 
-	// Validate input path
+	// Validate input
 	if inputPath == "" {
 		log.Fatal("Input path (-i) is required")
 	}
@@ -482,8 +482,19 @@ func extractSAZ(sazPath, outputDir string) error {
 			continue
 		}
 
-		// Create the output file
+		// Create the output file — validate against Zip Slip path traversal
 		outputPath := filepath.Join(outputDir, f.Name)
+		absOutput, err := filepath.Abs(outputPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve path for %s: %v", f.Name, err)
+		}
+		absDir, err := filepath.Abs(outputDir)
+		if err != nil {
+			return fmt.Errorf("failed to resolve output directory: %v", err)
+		}
+		if !strings.HasPrefix(absOutput, absDir+string(os.PathSeparator)) {
+			return fmt.Errorf("invalid file path in archive (path traversal): %s", f.Name)
+		}
 
 		// Create parent directories if they don't exist
 		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
@@ -818,12 +829,23 @@ func collectSessionData(dirPath, sessionID string, meta sessionMetadata, reqData
 }
 
 // isBinaryData checks if the given data contains binary content
+// Uses a two-stage approach:
+// 1. Quick heuristic: check for control characters (< 32) excluding \t, \n, \r
+// 2. UTF-8 validation: if data fails UTF-8 validation, it must be base64 encoded for JSON
 func isBinaryData(data []byte) bool {
+	// Quick heuristic: check for obvious binary markers (control characters)
 	for _, b := range data {
 		if b < 32 && b != '\t' && b != '\n' && b != '\r' {
 			return true
 		}
 	}
+
+	// Even if no control chars, check if it's valid UTF-8
+	// Invalid UTF-8 cannot be safely stored as a JSON string
+	if !utf8.Valid(data) {
+		return true
+	}
+
 	return false
 }
 

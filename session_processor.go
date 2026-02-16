@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/url"
@@ -607,7 +606,6 @@ func ProcessSessions(dirPath, outputPath string, deProxy, resolveHosts, http11, 
 
 			// Process the session for PCAP
 			if err := processSession(dirPath, sessionID, writer, deProxy, resolveHosts, http11, debug, srcIP, dstIP); err != nil {
-				writers.cleanup()
 				log.Printf("Error processing session %s: %v", sessionID, err)
 				continue // Skip to next session if this one fails
 			}
@@ -622,7 +620,7 @@ func ProcessSessions(dirPath, outputPath string, deProxy, resolveHosts, http11, 
 
 			// Parse XML metadata for additional fields
 			var xmlMeta xmlMetadata
-			data, err := ioutil.ReadFile(metaPath)
+			data, err := os.ReadFile(metaPath)
 			if err == nil {
 				_ = xml.Unmarshal(data, &xmlMeta) // Ignore errors, we'll use what we can
 			}
