@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 // These variables are defined in main.go and passed as parameters to the functions
@@ -363,7 +363,10 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 		srcIP = net.ParseIP(meta.clientIP)
 	}
 	if srcIP == nil {
-		srcIP = net.ParseIP(defaultSrcIP) // Use default source IP from parameters
+		srcIP = net.ParseIP(defaultSrcIP)
+	}
+	if srcIP == nil {
+		return fmt.Errorf("invalid source IP: %q", defaultSrcIP)
 	}
 
 	// Replace loopback source addresses with default to avoid invalid Ethernet frames
@@ -372,6 +375,9 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 			log.Printf("[DEBUG] Replacing loopback source IP %s with %s", srcIP.String(), defaultSrcIP)
 		}
 		srcIP = net.ParseIP(defaultSrcIP)
+		if srcIP == nil {
+			return fmt.Errorf("invalid default source IP: %q", defaultSrcIP)
+		}
 	}
 
 	var dstIP net.IP
@@ -379,7 +385,10 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 		dstIP = net.ParseIP(meta.hostIP)
 	}
 	if dstIP == nil {
-		dstIP = net.ParseIP(defaultDstIP) // Use default destination IP from parameters
+		dstIP = net.ParseIP(defaultDstIP)
+	}
+	if dstIP == nil {
+		return fmt.Errorf("invalid destination IP: %q", defaultDstIP)
 	}
 
 	// Replace loopback destination addresses with default to avoid invalid Ethernet frames
@@ -388,6 +397,9 @@ func generateSessionPackets(meta sessionMetadata, reqData, respData []byte, writ
 			log.Printf("[DEBUG] Replacing loopback destination IP %s with %s", dstIP.String(), defaultDstIP)
 		}
 		dstIP = net.ParseIP(defaultDstIP)
+		if dstIP == nil {
+			return fmt.Errorf("invalid default destination IP: %q", defaultDstIP)
+		}
 	}
 
 	// Parse ports
@@ -464,7 +476,7 @@ func ProcessSessions(dirPath, outputPath string, deProxy, resolveHosts, http11, 
 		httpsWriter := pcapgo.NewWriter(bufHttps)
 
 		// Write PCAP headers with Ethernet frames and maximum snapshot length
-		snapshotLength := uint32(65535) // Standard Ethernet MTU
+		snapshotLength := uint32(65535) // PCAP snapshot length (max capture size per packet)
 		if err := httpWriter.WriteFileHeader(snapshotLength, layers.LinkTypeEthernet); err != nil {
 			httpFile.Close()
 			httpsFile.Close()
@@ -497,7 +509,7 @@ func ProcessSessions(dirPath, outputPath string, deProxy, resolveHosts, http11, 
 		httpWriter := pcapgo.NewWriter(buf)
 
 		// Write PCAP header with Ethernet frames and maximum snapshot length
-		snapshotLength := uint32(65535) // Standard Ethernet MTU
+		snapshotLength := uint32(65535) // PCAP snapshot length (max capture size per packet)
 		if err := httpWriter.WriteFileHeader(snapshotLength, layers.LinkTypeEthernet); err != nil {
 			outputFile.Close()
 			return nil, fmt.Errorf("failed to write PCAP header: %v", err)

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 // HostMapper handles hostname to IP address mappings

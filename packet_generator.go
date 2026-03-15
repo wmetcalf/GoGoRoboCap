@@ -1,15 +1,16 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 const (
@@ -71,9 +72,13 @@ func ensureIPv4(ip net.IP, defaultIP net.IP) net.IP {
 
 // GenerateTCPSession generates a complete TCP session with the given request and response data
 func (pg *PacketGenerator) GenerateTCPSession(requestData, responseData []byte) error {
-	// Initialize TCP sequence numbers
-	clientISN := uint32(rand.Intn(1<<32 - 1))
-	serverISN := uint32(rand.Intn(1<<32 - 1))
+	// Initialize TCP sequence numbers using crypto/rand
+	var isnBuf [8]byte
+	if _, err := rand.Read(isnBuf[:]); err != nil {
+		return fmt.Errorf("failed to generate random ISN: %v", err)
+	}
+	clientISN := binary.BigEndian.Uint32(isnBuf[:4])
+	serverISN := binary.BigEndian.Uint32(isnBuf[4:8])
 
 	// Build the TCP handshake
 	if err := pg.generateTCPHandshake(clientISN, serverISN); err != nil {

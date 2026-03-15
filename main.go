@@ -29,7 +29,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 // sessionMetadata holds metadata about a Fiddler session
@@ -86,21 +86,26 @@ type SessionData struct {
 }
 
 var (
-	srcIP            string
-	dstIP            string
-	srcPort          int
-	dstPort          int
-	outputPath       string
-	inputPath        string
-	sazMode          bool
-	harMode          bool
-	gzMode           bool
-	jsonOutput       bool
-	debugMode        bool
-	deProxy          bool
-	resolveHosts     bool
-	http11           bool
-	split            bool
+	srcIP         string
+	dstIP         string
+	srcPort       int
+	dstPort       int
+	outputPath    string
+	inputPath     string
+	sazMode       bool
+	harMode       bool
+	pcapMode      bool
+	gzMode        bool
+	jsonOutput    bool
+	debugMode     bool
+	deProxy       bool
+	resolveHosts  bool
+	http11        bool
+	split         bool
+	showVersion   bool
+	tlsKeyLogPath string
+	tlsReplayMode string
+	tlsPortOffset int
 )
 
 // exportToJSON exports session data to a JSON file
@@ -145,6 +150,10 @@ func detectFileType(filePath string) (string, error) {
 		return "har", nil
 	} else if ext == ".gz" {
 		return "gz", nil
+	} else if ext == ".pcap" {
+		return "pcap", nil
+	} else if ext == ".pcapng" {
+		return "pcap", nil
 	}
 
 	// If extension doesn't clearly indicate the type, try to read file contents
@@ -181,6 +190,11 @@ func detectFileType(filePath string) (string, error) {
 		return "saz", nil
 	}
 
+	// Check if it's a pcapng file (Section Header Block magic: 0x0A0D0D0A)
+	if n >= 4 && buf[0] == 0x0A && buf[1] == 0x0D && buf[2] == 0x0D && buf[3] == 0x0A {
+		return "pcap", nil
+	}
+
 	// Default to directory mode if it's a directory
 	fileInfo, err := os.Stat(filePath)
 	if err == nil && fileInfo.IsDir() {
@@ -205,21 +219,31 @@ func decompressGZ(gzPath string, innerTypeHint string) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create gzip reader: %v", err)
 	}
-	defer gzReader.Close()
 
 	// Create temporary file for decompressed content
 	tempFile, err := os.CreateTemp("", "robocap-decompressed-*")
 	if err != nil {
+		gzReader.Close()
 		return "", "", fmt.Errorf("failed to create temp file: %v", err)
 	}
 	tempPath := tempFile.Name()
 
 	// Copy decompressed data to temp file
-	_, err = io.Copy(tempFile, gzReader)
-	tempFile.Close()
-	if err != nil {
+	_, copyErr := io.Copy(tempFile, gzReader)
+	closeErr := tempFile.Close()
+	// Close gzReader to verify gzip checksum
+	gzCloseErr := gzReader.Close()
+	if copyErr != nil {
 		os.Remove(tempPath)
-		return "", "", fmt.Errorf("failed to decompress gz file: %v", err)
+		return "", "", fmt.Errorf("failed to decompress gz file: %v", copyErr)
+	}
+	if closeErr != nil {
+		os.Remove(tempPath)
+		return "", "", fmt.Errorf("failed to write decompressed file: %v", closeErr)
+	}
+	if gzCloseErr != nil {
+		os.Remove(tempPath)
+		return "", "", fmt.Errorf("gzip checksum verification failed: %v", gzCloseErr)
 	}
 
 	// Use the hint if provided
@@ -260,6 +284,7 @@ func main() {
 	flag.StringVar(&inputPath, "i", "", "Input directory, SAZ, HAR, or GZ file")
 	flag.BoolVar(&sazMode, "saz", false, "Input is a SAZ file (auto-detected if not specified)")
 	flag.BoolVar(&harMode, "har", false, "Input is a HAR file (auto-detected if not specified)")
+	flag.BoolVar(&pcapMode, "pcap", false, "Input is a PCAP file for TLS key log replay")
 	flag.BoolVar(&gzMode, "gz", false, "Input is a gzipped file (auto-detected if not specified)")
 	flag.BoolVar(&jsonOutput, "json", false, "Output session data as JSON")
 	flag.BoolVar(&debugMode, "debug", false, "Enable debug logging")
@@ -267,7 +292,17 @@ func main() {
 	flag.BoolVar(&resolveHosts, "resolve", false, "Resolve hostnames to IP addresses via DNS (only applies when -deproxy is used)")
 	flag.BoolVar(&http11, "http11", false, "Downgrade HTTP/2 to HTTP/1.1 and add Content-Length headers")
 	flag.BoolVar(&split, "split", false, "Split output into separate files for HTTP and HTTPS")
+	flag.StringVar(&tlsKeyLogPath, "keylog", "", "TLS key log file used to decrypt TLS from a PCAP input")
+	flag.StringVar(&tlsReplayMode, "tlsmode", "decrypted", "TLS replay output mode: decrypted or mixed")
+	flag.IntVar(&tlsPortOffset, "tls-port-offset", 0, "Port offset for decrypted flows (e.g. -363 maps 443->80); use 0 to preserve original ports")
+	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
 	flag.Parse()
+
+	// Print version and exit if requested
+	if showVersion {
+		fmt.Println(versionInfo())
+		os.Exit(0)
+	}
 
 	// Validate input
 	if inputPath == "" {
@@ -291,7 +326,9 @@ func main() {
 			innerTypeHint = "har"
 			log.Printf("GZ mode with HAR hint: file will be decompressed and treated as HAR")
 		}
-	} else if !sazMode && !harMode && !gzMode {
+	} else if pcapMode || tlsKeyLogPath != "" {
+		fileType = "pcap"
+	} else if !sazMode && !harMode && !pcapMode && !gzMode {
 		detectedType, err := detectFileType(inputPath)
 		if err != nil {
 			log.Printf("Warning: could not auto-detect file type: %v, assuming directory mode", err)
@@ -304,12 +341,24 @@ func main() {
 		fileType = "saz"
 	} else if harMode {
 		fileType = "har"
+	} else if pcapMode {
+		fileType = "pcap"
 	} else if gzMode {
 		fileType = "gz"
 	}
 
 	// Process input based on detected or specified file type
 	switch fileType {
+	case "pcap":
+		// keylog is optional if input is pcapng with embedded Decryption Secrets Blocks
+		stats, err := ProcessTLSReplayPCAP(inputPath, tlsKeyLogPath, outputPath, tlsReplayMode, tlsPortOffset, debugMode)
+		if err != nil {
+			log.Fatalf("Failed to process PCAP TLS replay: %v", err)
+		}
+		fmt.Printf("Created: %s\n", outputPath)
+		fmt.Printf("Processed %d TCP flows, detected %d TLS flows, replayed %d decrypted flows\n",
+			stats.TotalTCPFlows, stats.TLSFlows, stats.DecryptedFlows)
+
 	case "gz":
 		// Decompress GZ file and process the inner content
 		log.Printf("Decompressing GZ file: %s", inputPath)
@@ -425,6 +474,14 @@ func main() {
 			log.Fatalf("Failed to process HAR file: %v", err)
 		}
 
+		// Export to JSON if enabled
+		if jsonOutput {
+			jsonPath := outputPath + ".json"
+			if err := exportToJSON(sessions, jsonPath); err != nil {
+				log.Fatalf("Failed to export JSON: %v", err)
+			}
+		}
+
 		// Log files created
 		fmt.Printf("Created: %s\n", outputPath)
 		if jsonOutput {
@@ -523,8 +580,8 @@ func extractSAZ(sazPath, outputDir string) error {
 			return fmt.Errorf("failed to extract file %s: %v", f.Name, err)
 		}
 
-		// Set file permissions
-		if err := os.Chmod(outputPath, f.Mode()); err != nil {
+		// Set file permissions to a safe default (ignore archive permissions)
+		if err := os.Chmod(outputPath, 0644); err != nil {
 			return fmt.Errorf("failed to set permissions for %s: %v", outputPath, err)
 		}
 

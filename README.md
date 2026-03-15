@@ -5,6 +5,8 @@ Go Based Conversion From HAR/SAZ files to PCAP. It should be faster than Scapy-b
 ## Features
 
 - Convert HAR (HTTP Archive) and SAZ (Fiddler) files to PCAP format
+- Decrypt TLS traffic from PCAP/PcapNG files using TLS key log files
+- PcapNG with embedded TLS keys (Decryption Secrets Blocks) supported automatically
 - Automatic file type detection
 - De-proxy URLs to convert proxy-style requests to standard HTTP requests
 - Optional DNS hostname resolution for accurate destination IPs
@@ -47,6 +49,14 @@ Usage of gogorobocap:
     	Source port (default 12345)
   -split
     	Split output into separate files for HTTP and HTTPS
+  -keylog string
+    	TLS key log file used to decrypt TLS from a PCAP input
+  -tlsmode string
+    	TLS replay output mode: decrypted or mixed (default "decrypted")
+  -tls-port-offset int
+    	Port offset for decrypted flows (e.g. -363 maps 443->80, default 0)
+  -version
+    	Print version information and exit
 ```
 
 ## Examples
@@ -139,6 +149,24 @@ Export session metadata to JSON for analysis:
 This creates:
 - `output.pcap` - The PCAP file
 - `output.pcap.json` - JSON metadata with request/response details
+
+### TLS Decryption from PCAP
+Decrypt TLS traffic using an external key log file:
+```bash
+./gogorobocap-linux-amd64 -i capture.pcap -keylog sslkeys.log
+```
+
+### PcapNG with Embedded TLS Keys
+If the pcapng file contains embedded Decryption Secrets Blocks, no key log file is needed:
+```bash
+./gogorobocap-linux-amd64 -i capture.pcapng
+```
+
+### Mixed Mode (Original + Decrypted)
+Output both the original encrypted traffic and decrypted flows:
+```bash
+./gogorobocap-linux-amd64 -i capture.pcap -keylog sslkeys.log -tlsmode mixed
+```
 
 ### Debug Mode
 Enable detailed logging to troubleshoot conversion issues:
