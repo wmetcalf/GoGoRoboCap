@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -545,13 +546,25 @@ func decryptBidirectionalTLSFlow(flow *bidirectionalTCPFlow, keyLog *tlsKeyLog, 
 		if secrets == nil {
 			return nil, true, fmt.Errorf("missing TLS 1.3 secrets for client_random=%s", clientRandomHex)
 		}
+		// Decrypt each direction independently — allow partial decryption when
+		// some secrets are missing (e.g., CLIENT_TRAFFIC_SECRET_0 may not be
+		// emitted by some TLS implementations' keylog callbacks)
 		clientData, err = decryptTLS13Stream(clientStream, suite, secrets.clientHandshake, secrets.clientApp)
 		if err != nil {
-			return nil, true, fmt.Errorf("client TLS 1.3 decrypt failed: %v", err)
+			if debug {
+				log.Printf("[DEBUG] client TLS 1.3 decrypt failed (partial ok): %v", err)
+			}
+			clientData = nil
 		}
 		serverData, err = decryptTLS13Stream(serverStream, suite, secrets.serverHandshake, secrets.serverApp)
 		if err != nil {
-			return nil, true, fmt.Errorf("server TLS 1.3 decrypt failed: %v", err)
+			if debug {
+				log.Printf("[DEBUG] server TLS 1.3 decrypt failed (partial ok): %v", err)
+			}
+			serverData = nil
+		}
+		if clientData == nil && serverData == nil {
+			return nil, true, fmt.Errorf("TLS 1.3 decrypt failed for both directions, client_random=%s", clientRandomHex)
 		}
 
 	case tlsVersion12:
@@ -908,17 +921,20 @@ func decryptTLS12Stream(stream []byte, directionCipher *tls12DirectionCipher) ([
 }
 
 func decryptTLS13Stream(stream []byte, suite tlsCipherSuite, handshakeSecret, appSecret []byte) ([]byte, error) {
-	if len(handshakeSecret) == 0 || len(appSecret) == 0 {
-		return nil, fmt.Errorf("TLS 1.3 replay requires both handshake and application traffic secrets")
+	if len(handshakeSecret) == 0 {
+		return nil, fmt.Errorf("TLS 1.3 replay requires at least the handshake traffic secret")
 	}
 
 	handshakeCipher, err := newTLS13DirectionCipher(suite, handshakeSecret)
 	if err != nil {
 		return nil, err
 	}
-	appCipher, err := newTLS13DirectionCipher(suite, appSecret)
-	if err != nil {
-		return nil, err
+	var appCipher *tls13DirectionCipher
+	if len(appSecret) > 0 {
+		appCipher, err = newTLS13DirectionCipher(suite, appSecret)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	type epoch int
@@ -954,6 +970,10 @@ func decryptTLS13Stream(stream []byte, suite tlsCipherSuite, handshakeSecret, ap
 
 		currentCipher := handshakeCipher
 		if currentEpoch == epochApplication {
+			if appCipher == nil {
+				// Missing application traffic secret — skip application data
+				continue
+			}
 			currentCipher = appCipher
 		}
 
@@ -1373,4 +1393,249 @@ func mergeTLSKeyLogs(base, override *tlsKeyLog) *tlsKeyLog {
 	}
 
 	return merged
+}
+
+// stripLeadingTLSRecords removes TLS record-layer framed data from the
+// beginning of a byte stream and returns only the trailing plaintext.
+// SSLproxy synthetic PCAPs prepend the original TLS ClientHello (and
+// sometimes ServerHello) to the decrypted application data. Suricata
+// sees those bytes, classifies the flow as TLS, and ignores the HTTP
+// that follows. This function strips them.
+func stripLeadingTLSRecords(data []byte) []byte {
+	offset := 0
+	for offset+5 <= len(data) {
+		contentType := data[offset]
+		// Valid TLS content types: 20-23
+		if contentType < tlsContentTypeChangeCipherSpec || contentType > tlsContentTypeApplicationData {
+			break
+		}
+		length := int(binary.BigEndian.Uint16(data[offset+3 : offset+5]))
+		if length <= 0 || offset+5+length > len(data) {
+			break
+		}
+		offset += 5 + length
+	}
+	if offset == 0 {
+		return data // no TLS records found, return as-is
+	}
+	return data[offset:]
+}
+
+// ProcessSSLProxyCleanPCAP reads SSLproxy synthetic PCAPs (which contain
+// TLS ClientHello bytes prepended to decrypted plaintext), strips the TLS
+// record-layer framing from the start of each client→server stream, and
+// writes clean TCP sessions that Suricata can parse for protocol detection.
+//
+// The inputPath can be a single PCAP file or a directory of PCAPs (as
+// produced by SSLproxy's -Y flag). All flows are merged into one output.
+func ProcessSSLProxyCleanPCAP(inputPath, outputPath string, portOffset int, debug bool) (*TLSReplayStats, error) {
+	// Collect input files
+	var inputFiles []string
+	info, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat input: %v", err)
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(inputPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read input directory: %v", err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasSuffix(name, ".pcap") || strings.HasSuffix(name, ".pcapng") {
+				inputFiles = append(inputFiles, filepath.Join(inputPath, name))
+			}
+		}
+		if len(inputFiles) == 0 {
+			return nil, fmt.Errorf("no .pcap/.pcapng files found in %s", inputPath)
+		}
+		sort.Strings(inputFiles)
+	} else {
+		inputFiles = []string{inputPath}
+	}
+
+	// Create output file
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create output PCAP: %v", err)
+	}
+	defer outputFile.Close()
+
+	writer := pcapgo.NewWriter(outputFile)
+	if err := writer.WriteFileHeader(65536, layers.LinkTypeEthernet); err != nil {
+		return nil, fmt.Errorf("failed to write PCAP header: %v", err)
+	}
+
+	stats := &TLSReplayStats{}
+
+	for _, inputFile := range inputFiles {
+		if err := processOneSSLProxyPCAP(inputFile, writer, stats, portOffset, debug); err != nil {
+			if debug {
+				log.Printf("[DEBUG] Skipping %s: %v", inputFile, err)
+			}
+			continue
+		}
+	}
+
+	return stats, nil
+}
+
+func processOneSSLProxyPCAP(inputPath string, writer *pcapgo.Writer, stats *TLSReplayStats, portOffset int, debug bool) error {
+	f, err := os.Open(inputPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	pcapng, err := isPcapNg(inputPath)
+	if err != nil {
+		return err
+	}
+
+	var packetSource *gopacket.PacketSource
+	if pcapng {
+		ngReader, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
+		if err != nil {
+			return err
+		}
+		packetSource = gopacket.NewPacketSource(ngReader, ngReader.LinkType())
+	} else {
+		reader, err := pcapgo.NewReader(f)
+		if err != nil {
+			return err
+		}
+		packetSource = gopacket.NewPacketSource(reader, reader.LinkType())
+	}
+
+	// Group packets by TCP flow
+	flows := map[string]*bidirectionalTCPFlow{}
+	for packet := range packetSource.Packets() {
+		metadata := packet.Metadata()
+		if metadata == nil {
+			continue
+		}
+
+		ipv4Layer := packet.Layer(layers.LayerTypeIPv4)
+		if ipv4Layer == nil {
+			continue
+		}
+		ipv4 := ipv4Layer.(*layers.IPv4)
+
+		tcpLayer := packet.Layer(layers.LayerTypeTCP)
+		if tcpLayer == nil {
+			continue
+		}
+		tcp := tcpLayer.(*layers.TCP)
+		if len(tcp.Payload) == 0 {
+			continue
+		}
+
+		src := flowEndpoint{ip: append(net.IP(nil), ipv4.SrcIP.To4()...), port: uint16(tcp.SrcPort)}
+		dst := flowEndpoint{ip: append(net.IP(nil), ipv4.DstIP.To4()...), port: uint16(tcp.DstPort)}
+		if src.ip == nil || dst.ip == nil {
+			continue
+		}
+
+		key, forward := canonicalFlowKey(src, dst)
+		flow, ok := flows[key]
+		if !ok {
+			flow = &bidirectionalTCPFlow{
+				endpointA: src,
+				endpointB: dst,
+				firstSeen: metadata.CaptureInfo.Timestamp,
+			}
+			if !forward {
+				flow.endpointA = dst
+				flow.endpointB = src
+			}
+			flows[key] = flow
+		}
+		flow.lastSeen = metadata.CaptureInfo.Timestamp
+
+		segment := streamSegment{
+			seq:     uint32(tcp.Seq),
+			payload: append([]byte(nil), tcp.Payload...),
+		}
+		if forward {
+			flow.aToB = append(flow.aToB, segment)
+		} else {
+			flow.bToA = append(flow.bToA, segment)
+		}
+	}
+
+	// Process each flow
+	orderedFlows := make([]*bidirectionalTCPFlow, 0, len(flows))
+	for _, flow := range flows {
+		orderedFlows = append(orderedFlows, flow)
+	}
+	sort.Slice(orderedFlows, func(i, j int) bool {
+		return orderedFlows[i].firstSeen.Before(orderedFlows[j].firstSeen)
+	})
+
+	for _, flow := range orderedFlows {
+		stats.TotalTCPFlows++
+
+		streamA := reassembleOrderedStream(flow.aToB)
+		streamB := reassembleOrderedStream(flow.bToA)
+
+		// Determine which side is the client (sent TLS ClientHello)
+		clientData, serverData := streamA, streamB
+		clientEP, serverEP := flow.endpointA, flow.endpointB
+		aHasTLS := len(streamA) >= 6 && streamA[0] == tlsContentTypeHandshake && streamA[1] == 0x03 && streamA[5] == tlsHandshakeClientHello
+		bHasTLS := len(streamB) >= 6 && streamB[0] == tlsContentTypeHandshake && streamB[1] == 0x03 && streamB[5] == tlsHandshakeClientHello
+
+		if bHasTLS && !aHasTLS {
+			clientData, serverData = streamB, streamA
+			clientEP, serverEP = flow.endpointB, flow.endpointA
+		} else if !aHasTLS && !bHasTLS {
+			// No TLS records in either direction — pass through as-is
+			if len(streamA) == 0 && len(streamB) == 0 {
+				continue
+			}
+		}
+
+		if aHasTLS || bHasTLS {
+			stats.TLSFlows++
+		}
+
+		// Strip leading TLS records only from flows that had TLS
+		var cleanClient, cleanServer []byte
+		if aHasTLS || bHasTLS {
+			cleanClient = stripLeadingTLSRecords(clientData)
+			cleanServer = stripLeadingTLSRecords(serverData)
+		} else {
+			cleanClient = clientData
+			cleanServer = serverData
+		}
+
+		if len(cleanClient) == 0 && len(cleanServer) == 0 {
+			if debug {
+				log.Printf("[DEBUG] sslproxy-clean: flow %s had only TLS records, no plaintext", describeFlow(flow))
+			}
+			continue
+		}
+
+		dstPort := serverEP.port
+		if portOffset != 0 {
+			shifted := int(dstPort) + portOffset
+			if shifted >= 1 && shifted <= 65535 {
+				dstPort = uint16(shifted)
+			}
+		}
+
+		pg := NewPacketGenerator(writer, clientEP.ip, serverEP.ip, clientEP.port, dstPort, debug)
+		if !flow.firstSeen.IsZero() {
+			pg.timestamp = flow.firstSeen
+		}
+
+		if err := pg.GenerateTCPSession(cleanClient, cleanServer); err != nil {
+			if debug {
+				log.Printf("[DEBUG] sslproxy-clean: failed to write flow %s: %v", describeFlow(flow), err)
+			}
+			continue
+		}
+		stats.DecryptedFlows++
+	}
+
+	return nil
 }

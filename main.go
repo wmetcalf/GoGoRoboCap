@@ -102,10 +102,11 @@ var (
 	resolveHosts  bool
 	http11        bool
 	split         bool
-	showVersion   bool
-	tlsKeyLogPath string
-	tlsReplayMode string
-	tlsPortOffset int
+	showVersion      bool
+	tlsKeyLogPath    string
+	tlsReplayMode    string
+	tlsPortOffset    int
+	sslproxyClean    bool
 )
 
 // exportToJSON exports session data to a JSON file
@@ -295,6 +296,7 @@ func main() {
 	flag.StringVar(&tlsKeyLogPath, "keylog", "", "TLS key log file used to decrypt TLS from a PCAP input")
 	flag.StringVar(&tlsReplayMode, "tlsmode", "decrypted", "TLS replay output mode: decrypted or mixed")
 	flag.IntVar(&tlsPortOffset, "tls-port-offset", 0, "Port offset for decrypted flows (e.g. -363 maps 443->80); use 0 to preserve original ports")
+	flag.BoolVar(&sslproxyClean, "sslproxy-clean", false, "Strip TLS ClientHello from SSLproxy synthetic PCAPs (input can be file or directory)")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
 	flag.Parse()
 
@@ -326,6 +328,8 @@ func main() {
 			innerTypeHint = "har"
 			log.Printf("GZ mode with HAR hint: file will be decompressed and treated as HAR")
 		}
+	} else if sslproxyClean {
+		fileType = "sslproxy-clean"
 	} else if pcapMode || tlsKeyLogPath != "" {
 		fileType = "pcap"
 	} else if !sazMode && !harMode && !pcapMode && !gzMode {
@@ -349,6 +353,15 @@ func main() {
 
 	// Process input based on detected or specified file type
 	switch fileType {
+	case "sslproxy-clean":
+		stats, err := ProcessSSLProxyCleanPCAP(inputPath, outputPath, tlsPortOffset, debugMode)
+		if err != nil {
+			log.Fatalf("Failed to process SSLproxy synthetic PCAPs: %v", err)
+		}
+		fmt.Printf("Created: %s\n", outputPath)
+		fmt.Printf("Processed %d TCP flows, %d had TLS records, cleaned %d flows\n",
+			stats.TotalTCPFlows, stats.TLSFlows, stats.DecryptedFlows)
+
 	case "pcap":
 		// keylog is optional if input is pcapng with embedded Decryption Secrets Blocks
 		stats, err := ProcessTLSReplayPCAP(inputPath, tlsKeyLogPath, outputPath, tlsReplayMode, tlsPortOffset, debugMode)
