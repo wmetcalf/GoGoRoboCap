@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/ip4defrag"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcapgo"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -247,6 +248,9 @@ func ProcessTLSReplayPCAP(inputPath, keylogPath, outputPath, replayMode string, 
 	}
 
 	flows := map[string]*bidirectionalTCPFlow{}
+	// A PacketSource decodes IPv4 fragments independently. Reassemble them
+	// before decoding TCP to retain complete TLS records.
+	defragmenter := ip4defrag.NewIPv4Defragmenter()
 	var lastPacketTime time.Time
 
 	for packet := range packetSource.Packets() {
@@ -269,12 +273,24 @@ func ProcessTLSReplayPCAP(inputPath, keylogPath, outputPath, replayMode string, 
 			continue
 		}
 		ipv4 := ipv4Layer.(*layers.IPv4)
-
-		tcpLayer := packet.Layer(layers.LayerTypeTCP)
-		if tcpLayer == nil {
+		ipv4, err = defragmenter.DefragIPv4WithTimestamp(ipv4, metadata.CaptureInfo.Timestamp)
+		if err != nil {
+			if debug {
+				log.Printf("[DEBUG] IPv4 reassembly skipped: %v", err)
+			}
 			continue
 		}
-		tcp := tcpLayer.(*layers.TCP)
+		if ipv4 == nil || ipv4.Protocol != layers.IPProtocolTCP {
+			continue
+		}
+
+		var tcp layers.TCP
+		if err := tcp.DecodeFromBytes(ipv4.Payload, gopacket.NilDecodeFeedback); err != nil {
+			if debug {
+				log.Printf("[DEBUG] TCP decode skipped for %s -> %s: %v", ipv4.SrcIP, ipv4.DstIP, err)
+			}
+			continue
+		}
 		if len(tcp.Payload) == 0 {
 			continue
 		}
